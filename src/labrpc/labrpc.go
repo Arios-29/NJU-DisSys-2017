@@ -57,25 +57,30 @@ import "strings"
 import "math/rand"
 import "time"
 
+// reqMsg 是请求消息类
 type reqMsg struct {
-	endname  interface{} // name of sending ClientEnd
-	svcMeth  string      // e.g. "Raft.AppendEntries"
-	argsType reflect.Type
-	args     []byte
-	replyCh  chan replyMsg
+	//interface{}是一种特殊的类型,可以理解成所有类的基类, endname可以被赋予任何类型的值
+	endname  interface{}   // 发送该请求消息的节点名 ClientEnd
+	svcMeth  string        // e.g. "Raft.AppendEntries",指明请求消息中的命令类型
+	argsType reflect.Type  // argsType是通过reflect.TypeOf(args)反射得到的args变量的类型类
+	args     []byte        //请求消息中的消息内容
+	replyCh  chan replyMsg //存放对该请求消息的回复信息的通道
 }
 
+// replyMsg 是回复信息类
 type replyMsg struct {
 	ok    bool
 	reply []byte
 }
 
+// ClientEnd 是服务器节点类
 type ClientEnd struct {
 	endname interface{} // this end-point's name
-	ch      chan reqMsg // copy of Network.endCh
+	//ch 是网络中存放请求消息的通道
+	ch chan reqMsg // copy of Network.endCh
 }
 
-// send an RPC, wait for the reply.
+// Call sends an RPC, wait for the reply.
 // the return value indicates success; false means the
 // server couldn't be contacted.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
@@ -90,7 +95,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
-	e.ch <- req
+	e.ch <- req //将请求消息发送到网络通道
 
 	rep := <-req.replyCh
 	if rep.ok {
@@ -114,7 +119,7 @@ type Network struct {
 	enabled        map[interface{}]bool        // by end name
 	servers        map[interface{}]*Server     // servers, by name
 	connections    map[interface{}]interface{} // endname -> servername
-	endCh          chan reqMsg
+	endCh          chan reqMsg                 // 网络中存放请求消息的通道
 }
 
 func MakeNetwork() *Network {
@@ -123,7 +128,7 @@ func MakeNetwork() *Network {
 	rn.ends = map[interface{}]*ClientEnd{}
 	rn.enabled = map[interface{}]bool{}
 	rn.servers = map[interface{}]*Server{}
-	rn.connections = map[interface{}](interface{}){}
+	rn.connections = map[interface{}]interface{}{}
 	rn.endCh = make(chan reqMsg)
 
 	// single goroutine to handle all ClientEnd.Call()s
@@ -170,6 +175,7 @@ func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	}
 	reliable = rn.reliable
 	longreordering = rn.longReordering
+	// 使用了命名返回参数
 	return
 }
 
@@ -189,7 +195,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 	if enabled && servername != nil && server != nil {
 		if reliable == false {
 			// short delay
-			ms := (rand.Int() % 27)
+			ms := rand.Int() % 27
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
@@ -252,11 +258,11 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		if rn.longDelays {
 			// let Raft tests check that leader doesn't send
 			// RPCs synchronously.
-			ms = (rand.Int() % 7000)
+			ms = rand.Int() % 7000
 		} else {
 			// many kv tests require the client to try each
 			// server in fairly rapid succession.
-			ms = (rand.Int() % 100)
+			ms = rand.Int() % 100
 		}
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		req.replyCh <- replyMsg{false, nil}
@@ -264,7 +270,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 
 }
 
-// create a client end-point.
+// MakeEnd : create a client end-point.
 // start the thread that listens and delivers.
 func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 	rn.mu.Lock()
@@ -298,7 +304,7 @@ func (rn *Network) DeleteServer(servername interface{}) {
 	rn.servers[servername] = nil
 }
 
-// connect a ClientEnd to a server.
+// Connect : connect a ClientEnd to a server.
 // a ClientEnd can only be connected once in its lifetime.
 func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.mu.Lock()
@@ -307,7 +313,7 @@ func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.connections[endname] = servername
 }
 
-// enable/disable a ClientEnd.
+// Enable : enable/disable a ClientEnd.
 func (rn *Network) Enable(endname interface{}, enabled bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -315,7 +321,7 @@ func (rn *Network) Enable(endname interface{}, enabled bool) {
 	rn.enabled[endname] = enabled
 }
 
-// get a server's count of incoming RPCs.
+// GetCount : get a server's count of incoming RPCs.
 func (rn *Network) GetCount(servername interface{}) int {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -324,11 +330,9 @@ func (rn *Network) GetCount(servername interface{}) int {
 	return svr.GetCount()
 }
 
-//
-// a server is a collection of services, all sharing
+// Server : a server is a collection of services, all sharing
 // the same rpc dispatcher. so that e.g. both a Raft
 // and a k/v server can listen to the same rpc endpoint.
-//
 type Server struct {
 	mu       sync.Mutex
 	services map[string]*Service
