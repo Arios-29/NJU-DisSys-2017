@@ -17,19 +17,25 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"log"
+	"sync"
+)
 import "labrpc"
 
 // import "bytes"
 // import "encoding/gob"
 
+type Log struct {
+	Term     int
+	LogIndex int
+	Command  interface{}
+}
 
-
-//
+// ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make().
-//
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
@@ -37,18 +43,38 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
-//
-// A Go object implementing a single Raft peer.
-//
+//三种状态
+const (
+	leader    = 0
+	candidate = 1
+	follower  = 2
+)
+
+// Raft : A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+	mu                     sync.Mutex
+	peers                  []*labrpc.ClientEnd
+	persister              *Persister
+	me                     int // index into peers[]
+	heartBeatMissedCounter int // election timeout
 
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	//所有状态都需要持久化的属性
+	state    int   // 节点当前状态
+	term     int   //节点current term
+	votedFor int   //本节点当前term投票给了哪个节点
+	log      []Log //日志
+
+	//volatile state on all servers
+	commitIndex int //对本节点而言已知的最新一条committed的日志的索引
+	lastApplied int //本节点最新一条已被applied的日志的索引
+
+	//volatile state on a leader
+	nextIndex  []int // nextIndex[i]表示要让follower_i同步的下一条日志的索引
+	matchIndex []int // matchIndex[i]表示与follower_i匹配的最后一条日志的索引
 
 }
 
@@ -90,28 +116,132 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.yyy)
 }
 
+// AppendEntriesArgs : example AppendEntries RPC arguments structure
+type AppendEntriesArgs struct {
+	Term        int   // leader's term
+	LeaderId    int   //leader的id
+	PreLogIndex int   //
+	PreLogTerm  int   //
+	CommitIndex int   //leader已经committed的最近一条日志的索引
+	Entries     []Log //需要同步的日志
+}
 
+// AppendEntriesReply : example AppendEntries RPC reply structure
+type AppendEntriesReply struct {
+	Term        int  // follower的current term
+	Success     bool //AppendEntries是否成功
+	CommitIndex int  //用于告知leader本节点已知的最近一条committed的日志的索引
+}
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-//
-// example RequestVote RPC arguments structure.
-//
+	log.Printf("Leader %d in term %d ask Peer %d in term %d to append entries", args.LeaderId, args.Term, rf.me, rf.term)
+
+	// leader的term大于或等于本节点的term
+	if args.Term >= rf.term {
+		rf.term = args.Term       //更新本节点的term
+		if rf.state != follower { //term更小的leader或candidate要转变为本leader的follower
+			rf.TurnFollower(rf.term)
+			rf.votedFor = args.LeaderId
+		}
+		rf.persist()
+
+		//要同步的日志为空,说明此时为心跳信号
+		if len(args.Entries) == 0 {
+
+		} else { //要同步的日志不为空
+
+		}
+	} else {
+		log.Printf("Leader %d in term %d find a Peer %d whose term %d is bigger", args.LeaderId, args.Term, rf.me, rf.term)
+		reply.Term = rf.term  //让leader更新term
+		reply.Success = false //拒绝承认该leader
+		reply.CommitIndex = rf.commitIndex
+		return
+	}
+}
+
+// RequestVoteArgs : example RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
-	// Your data here.
+	Term         int // candidate's term
+	Candidate    int //请求投票的candidate的id
+	LastLogIndex int // candidate的日志中最后一条entry的索引
+	LastLogTerm  int // candidate的日志中最后一条entry的term
 }
 
-//
-// example RequestVote RPC reply structure.
-//
+// RequestVoteReply : example RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	// Your data here.
+	Term        int  //投票者的current term
+	VoteGranted bool //投票与否
 }
 
-//
-// example RequestVote RPC handler.
-//
+// RequestVote : example RequestVote RPC handler.
+// DONE
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// candidate的term小于或等于voter的term
+	// 为什么<= ?
+	if args.Term <= rf.term {
+		log.Printf("refuse to vote: Candidate %d in term %d requests vote, but its term is less than Voter %d in term %d", args.Candidate, args.Term, rf.me, rf.term)
+		reply.Term = args.Term    //让该Candidate更新term，转为follower
+		reply.VoteGranted = false //拒绝投票
+		return
+	} else {
+		// 判断candidate的log是不是更up-to-date
+		// Rule 1: candidate的log的最后一条日志的term更大,candidate的log更up-to-date
+		if args.LastLogTerm > rf.log[len(rf.log)-1].Term {
+			log.Printf("agree to vote: Candidate %d in term %d has a more up-to-date log than Voter %d in term %d with Rule 1", args.Candidate, args.Term, rf.me, rf.term)
+			rf.TurnFollower(args.Term) //voter成为该candidate的follower
+			rf.votedFor = args.Candidate
+			rf.persist()
+			reply.Term = rf.term
+			reply.VoteGranted = true //同意投票
+			return
+		}
+		// Rule 2: candidate的log的最后一条日志的term与voter相同,则判断log长度
+		if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
+			// candidate的log更长或相同长, candidate的log更up-to-date
+			if args.LastLogIndex >= len(rf.log) {
+				log.Printf("agree to vote: Candidate %d in term %d has a more up-to-date log than Voter %d in term %d with Rule2", args.Candidate, args.Term, rf.me, rf.term)
+				rf.TurnFollower(args.Term)
+				rf.votedFor = args.Candidate
+				rf.persist()
+				reply.Term = rf.term
+				reply.VoteGranted = true //同意投票
+				return
+			} else {
+				log.Printf("refuse to vote: Candidate %d in term %d has a shorter log than Voter %d in term %d", args.Candidate, args.Term, rf.me, rf.term)
+				if rf.state == leader {
+					//candidate的term大于本voter的term,如果本voter是leader则必须变成follower
+					rf.TurnFollower(args.Term)
+				}
+				//follower和candidate只需要更新term,不用重新计时election timeout
+				rf.term = args.Term
+				rf.persist()
+				reply.Term = rf.term
+				reply.VoteGranted = false //拒绝投票
+				return
+			}
+		}
+		// candidate的log的最后一条日志的term小于voter, voter的log更up-to-date
+		if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+			log.Printf("refuse to vote: Candidate %d in term %d has a less up-to-date log than Voter %d in term %d", args.Candidate, args.Term, rf.me, rf.term)
+			if rf.state == leader {
+				//candidate的term大于本voter的term,如果本voter是leader则必须变成follower
+				rf.TurnFollower(args.Term)
+			}
+			//follower和candidate只需要更新term,不用重新计时election timeout
+			rf.term = args.Term
+			rf.persist()
+			reply.Term = rf.term
+			reply.VoteGranted = false //拒绝投票
+			return
+		}
+	}
 }
 
 //
@@ -136,7 +266,6 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -155,7 +284,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-
 	return index, term, isLeader
 }
 
@@ -167,6 +295,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+// TurnFollower : 变为follower状态并重新计时election timeout
+func (rf *Raft) TurnFollower(term int) {
+	log.Printf("Peer %d in term %d turns a follower", rf.me, rf.term)
+	rf.heartBeatMissedCounter = 0 //election timeout设置为0
+	rf.term = term
+	rf.state = follower
+	rf.votedFor = -1
 }
 
 //
@@ -191,7 +328,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
