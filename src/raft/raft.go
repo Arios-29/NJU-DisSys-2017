@@ -116,12 +116,14 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.yyy)
 }
 
+//====================================================================================================================
+
 // AppendEntriesArgs : example AppendEntries RPC arguments structure
 type AppendEntriesArgs struct {
 	Term        int   // leader's term
 	LeaderId    int   //leader的id
-	PreLogIndex int   //
-	PreLogTerm  int   //
+	PreLogIndex int   //要同步的日志的前一条日志的索引
+	PreLogTerm  int   //要同步的的日志的前一条日志的term
 	CommitIndex int   //leader已经committed的最近一条日志的索引
 	Entries     []Log //需要同步的日志
 }
@@ -133,11 +135,25 @@ type AppendEntriesReply struct {
 	CommitIndex int  //用于告知leader本节点已知的最近一条committed的日志的索引
 }
 
+func Min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+func Max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+// AppendEntries : example AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	log.Printf("Leader %d in term %d ask Peer %d in term %d to append entries", args.LeaderId, args.Term, rf.me, rf.term)
 
 	// leader的term大于或等于本节点的term
 	if args.Term >= rf.term {
@@ -150,9 +166,52 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		//要同步的日志为空,说明此时为心跳信号
 		if len(args.Entries) == 0 {
-
+			log.Printf("Leader %d in term %d sends Peer %d in term %d HeartBeat", args.LeaderId, args.Term, rf.me, rf.term)
+			// 更新本节点committed的log索引
+			if rf.commitIndex < args.CommitIndex {
+				if args.PreLogIndex < len(rf.log) && rf.log[args.PreLogIndex].Term == args.PreLogTerm {
+					rf.commitIndex = Min(args.PreLogIndex, args.CommitIndex)
+				}
+			}
+			rf.heartBeatMissedCounter = 0 //收到valid心跳信号,重新计时
+			reply.Success = true
+			reply.CommitIndex = rf.commitIndex
+			reply.Term = args.Term
+			return
 		} else { //要同步的日志不为空
-
+			log.Printf("Leader %d in term %d ask Peer %d in term %d to append entries(index starts from %d)", args.LeaderId, args.Term, rf.me, rf.term, args.PreLogIndex+1)
+			// 本节点已经committed过了leader发来的日志记录
+			if rf.commitIndex >= args.PreLogIndex+len(args.Entries) {
+				log.Printf("Peer % d in term %d has already committed the entries Leader %d in term %d sends", rf.me, rf.term, args.LeaderId, args.Term)
+				reply.Success = true
+				reply.Term = rf.term
+				reply.CommitIndex = rf.commitIndex
+				return
+			}
+			// 没有匹配到追加点
+			if args.PreLogIndex >= len(rf.log) || rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+				log.Printf("Leader %d in term %d ask Peer %d in term %d to append entries(index starts from %d), not match", args.LeaderId, args.Term, rf.me, rf.term, args.PreLogIndex+1)
+				reply.Success = false
+				reply.Term = args.Term
+				reply.CommitIndex = rf.commitIndex
+				return
+			} else { //匹配到追加点
+				log.Printf("Leader %d in term %d ask Peer %d in term %d to append entries(index starts from %d), match", args.LeaderId, args.Term, rf.me, rf.term, args.PreLogIndex+1)
+				//同步leader发来的日志
+				rf.log = rf.log[0 : args.PreLogIndex+1]
+				for _, entry := range args.Entries {
+					rf.log = append(rf.log, entry)
+				}
+				reply.Term = rf.term
+				reply.Success = true
+				//更新本节点committed的日志的索引
+				if rf.commitIndex < args.CommitIndex {
+					rf.commitIndex = Min(args.CommitIndex, Max(args.PreLogIndex, rf.commitIndex))
+				}
+				reply.CommitIndex = rf.commitIndex
+				rf.persist()
+				return
+			}
 		}
 	} else {
 		log.Printf("Leader %d in term %d find a Peer %d whose term %d is bigger", args.LeaderId, args.Term, rf.me, rf.term)
@@ -162,6 +221,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 }
+
+//=====================================================================================================================
 
 // RequestVoteArgs : example RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
@@ -184,7 +245,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	// candidate的term小于或等于voter的term
-	// 为什么<= ?
 	if args.Term <= rf.term {
 		log.Printf("refuse to vote: Candidate %d in term %d requests vote, but its term is less than Voter %d in term %d", args.Candidate, args.Term, rf.me, rf.term)
 		reply.Term = args.Term    //让该Candidate更新term，转为follower
@@ -266,7 +326,8 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-//
+//====================================================================================================================
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
