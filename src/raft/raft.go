@@ -111,9 +111,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	candidateTerm := args.Term
 	myTerm := rf.currentTerm
-
+	//log.Printf("server %d is asked to vote for candidate %d", rf.me, args.CandidateId)
 	// candidate的term更小,拒绝投票
 	if candidateTerm < myTerm {
+		//log.Printf("sever %d with term %d refused to vote for candidate %d with a smaller term %d\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 		reply.VoteGranted = false
 		reply.Term = myTerm
 		return
@@ -128,6 +129,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if candidateTerm == myTerm {
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId { //本节点还未投票
 			if rf.MoreUpToDate(args) { //candidate的log更up-to-date
+				//log.Printf("server %d votes for candidate %d\n", rf.me, args.CandidateId)
 				reply.VoteGranted = true
 				reply.Term = myTerm
 				rf.votedFor = args.CandidateId
@@ -135,12 +137,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.persist()
 				return
 			} else {
+				//log.Printf("server %d refuses to vote for candidate %d because of up-to-date rule\n", rf.me, args.CandidateId)
 				reply.VoteGranted = false
 				reply.Term = myTerm
 				rf.persist()
 				return
 			}
 		} else {
+			//log.Printf("server %d refuses to vote for candidate %d it has voted\n", rf.me, args.CandidateId)
 			reply.VoteGranted = false
 			reply.Term = myTerm
 			rf.persist()
@@ -155,9 +159,10 @@ func (rf *Raft) Timing() {
 		if rf.killed() {
 			return
 		}
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 
 		rf.mu.Lock()
+		//log.Printf("server %d with term %d starts test election timeout\n", rf.me, rf.currentTerm)
 		rand.Seed(time.Now().UnixNano())
 		electionTimeOut := time.Duration(200+rand.Intn(150)) * time.Millisecond //election timeout是200~350ms中的随机值
 		elapse := time.Now().Sub(rf.lastActiveTime)                             //持续没有收到心跳信号或投票请求的时间
@@ -166,6 +171,7 @@ func (rf *Raft) Timing() {
 			continue
 		}
 		if elapse > electionTimeOut {
+			//log.Printf("follower %d election timeout with term %d", rf.me, rf.currentTerm)
 			rf.TurnCandidate() //转变为candidate并且已经给自己投了一票
 			//发起投票
 			args := &RequestVoteArgs{
@@ -175,10 +181,12 @@ func (rf *Raft) Timing() {
 				LastLogTerm:  rf.log[len(rf.log)-1].Term,
 			}
 			rf.mu.Unlock()
+			//log.Printf("candidate %d with term %d start an election\n", rf.me, rf.currentTerm)
 			rf.StartAnLeaderElection(args)
 			// 发起一个选举后rf要么是leader要么是follower
 		} else {
-			continue
+			rf.mu.Unlock()
+			//log.Printf("server %d with term not election timeout\n", rf.me)
 		}
 	}
 }
@@ -194,12 +202,16 @@ func (rf *Raft) StartAnLeaderElection(args *RequestVoteArgs) {
 	sumVotes := 1 //总票数
 	received := 1 //已统计的票数
 	voteChan := make(chan *Vote, len(rf.peers))
+	//w := sync.WaitGroup{}
 	for id := 0; id < len(rf.peers); id++ {
+		//w.Add(1)
 		go func(id int) {
+			//defer w.Done()
 			if id == rf.me {
 				return
 			}
 			reply := &RequestVoteReply{}
+			//log.Printf("candidate %d with term %d ask server %d to vote\n", rf.me, rf.currentTerm, id)
 			ok := rf.sendRequestVote(id, args, reply)
 			if ok {
 				voteChan <- &Vote{reply, id}
@@ -210,11 +222,14 @@ func (rf *Raft) StartAnLeaderElection(args *RequestVoteArgs) {
 	}
 	maxTerm := 0 //发现的最大term
 	//统计结果
+	//w.Wait()
+	//log.Printf("candidate %d starts to statistic votes\n", rf.me)
 	undone := true
 	for undone {
 		select {
 		case vote := <-voteChan:
 			received += 1
+			//log.Printf("candidate %d gets a reply\n", rf.me)
 			if vote.reply != nil { //成功收到一个回复
 				if vote.reply.VoteGranted == true {
 					sumVotes += 1
@@ -223,28 +238,33 @@ func (rf *Raft) StartAnLeaderElection(args *RequestVoteArgs) {
 					maxTerm = vote.reply.Term
 				}
 			}
-			if sumVotes > 2*len(rf.peers) || received == len(rf.peers) { //退出统计过程
+			if 2*sumVotes > len(rf.peers) || received == len(rf.peers) { //退出统计过程
 				undone = false
 			}
 		}
 	}
 	//根据结果做出相应动作
+	//log.Printf("candidate %d finished statistic\n", rf.me)
 	rf.mu.Lock()
 	if rf.state != candidate { // 在发送投票信号或统计投票期间被一个合法leader变成follower了
+		//log.Printf("candidate %d turns follower during election\n", rf.me)
 		rf.mu.Unlock()
 		return
 	}
 	if maxTerm > rf.currentTerm { // 发现一个更高的term
+		//log.Printf("candidate %d finds a server with higher term\n", rf.me)
 		rf.TurnFollower(maxTerm)
 		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
-	if sumVotes > 2*len(rf.peers) { //赢得选举
+	if 2*sumVotes > len(rf.peers) { //赢得选举
+		//log.Printf("candidate %d won \n", rf.me)
 		rf.TurnLeader()
 		rf.mu.Unlock()
 		return
 	} else {
+		//log.Printf("candidate %d does not have enough votes\n", rf.me)
 		rf.TurnFollower(rf.currentTerm) //选举没有产生结果,变回follower重新计时等待再次选举
 		rf.mu.Unlock()
 		return
@@ -330,7 +350,7 @@ func (rf *Raft) BroadcastMsg() {
 		if rf.killed() {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 
 		rf.mu.Lock()
 		if rf.state != leader {
@@ -342,6 +362,7 @@ func (rf *Raft) BroadcastMsg() {
 			rf.mu.Unlock()
 			continue
 		} else { //发送信号
+			//log.Printf("leader %d with term %d heartbeat timeout\n", rf.me, rf.currentTerm)
 			rf.lastBroadcastTime = time.Now()
 			rf.mu.Unlock()
 			rf.Broadcasting()
@@ -383,6 +404,7 @@ func (rf *Raft) Broadcasting() {
 			}
 			rf.mu.Unlock()
 			reply := &AppendEntriesReply{}
+			//log.Printf("leader %d with term %d send hb to server %d\n", rf.me, rf.currentTerm, id)
 			ok := rf.SendAppendEntries(id, args, reply)
 			if ok {
 				receivedMsg <- &ACK{reply, id}
@@ -390,6 +412,7 @@ func (rf *Raft) Broadcasting() {
 				receivedMsg <- &ACK{nil, id}
 			}
 			ack := <-receivedMsg
+			//log.Printf("leader %d with term %d got ack from server %d\n", rf.me, rf.currentTerm, id)
 			if ack.reply != nil {
 				rf.mu.Lock()
 				if rf.state != leader { //后面的信号也不用发了
@@ -437,6 +460,7 @@ func Min(a int, b int) int {
 //周期性commit & apply===========================================================================================
 
 func (rf *Raft) Commit() {
+	//log.Printf("leader %d with term %d commits\n", rf.me, rf.currentTerm)
 	matchIndex := make([]int, len(rf.matchIndex))
 	copy(matchIndex, rf.matchIndex)
 	sort.Ints(matchIndex)
@@ -448,6 +472,7 @@ func (rf *Raft) Commit() {
 }
 
 func (rf *Raft) Apply() {
+	//log.Printf("server %d with term %d applies\n", rf.me, rf.currentTerm)
 	for index := rf.lastApplied; index <= rf.commitIndex; index++ {
 		*rf.applyCh <- ApplyMsg{
 			Index:       index,
@@ -463,7 +488,7 @@ func (rf *Raft) CommitAndApply() {
 		if rf.killed() {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 
 		rf.mu.Lock()
 		commitAndApplyTimeout := 40 * time.Millisecond
@@ -472,6 +497,7 @@ func (rf *Raft) CommitAndApply() {
 			continue
 		}
 		rf.lastCommitTime = time.Now()
+		//log.Printf("server %d with term %d starts to commit and apply\n", rf.me, rf.currentTerm)
 		if rf.state == leader { //leader负责提交
 			rf.Commit()
 		}
@@ -483,6 +509,7 @@ func (rf *Raft) CommitAndApply() {
 //状态转换================================================================================================
 
 func (rf *Raft) TurnFollower(term int) {
+	//log.Printf("server %d turns follower with new term%d\n", rf.me, term)
 	rf.currentTerm = term
 	rf.state = follower
 	rf.votedFor = -1
@@ -491,6 +518,7 @@ func (rf *Raft) TurnFollower(term int) {
 }
 
 func (rf *Raft) TurnCandidate() {
+	//log.Printf("follower %d with term %d turns candidate\n", rf.me, rf.currentTerm)
 	rf.currentTerm += 1
 	rf.state = candidate
 	rf.votedFor = rf.me
@@ -501,6 +529,7 @@ func (rf *Raft) TurnCandidate() {
 func (rf *Raft) TurnLeader() {
 	rf.state = leader
 	rf.leaderId = rf.me
+	//log.Printf("server %d turns leader \n", rf.me)
 	for id := 0; id < len(rf.peers); id++ {
 		rf.nextIndex[id] = len(rf.log)
 		rf.matchIndex[id] = 0
